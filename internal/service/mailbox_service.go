@@ -13,24 +13,38 @@ type MailboxService struct {
 }
 
 // NewMailboxService creates a new mailbox service.
-func NewMailboxService(manager *imapPkg.Manager) *MailboxService {
-	return &MailboxService{manager: manager}
+// Returns an error if manager is nil.
+func NewMailboxService(manager *imapPkg.Manager) (*MailboxService, error) {
+	if manager == nil {
+		return nil, fmt.Errorf("nil IMAP manager")
+	}
+	return &MailboxService{manager: manager}, nil
 }
 
 // ListMailboxes returns all mailboxes for the given account.
 func (s *MailboxService) ListMailboxes(accountID string) ([]*domain.Mailbox, error) {
-	c, err := s.manager.GetClient(accountID)
+	var mailboxes []*domain.Mailbox
+	err := s.manager.DoWithClient(accountID, func(c *imapPkg.Client) error {
+		var listErr error
+		mailboxes, listErr = c.ListMailboxes()
+		return listErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("getting client: %w", err)
 	}
-	return c.ListMailboxes()
+	return mailboxes, nil
 }
 
 // SelectMailbox selects a mailbox and returns its status.
 func (s *MailboxService) SelectMailbox(accountID, name string) (*domain.Mailbox, error) {
-	c, err := s.manager.GetClient(accountID)
+	var mbox *domain.Mailbox
+	err := s.manager.DoWithClient(accountID, func(c *imapPkg.Client) error {
+		var selectErr error
+		mbox, selectErr = c.SelectMailbox(name)
+		return selectErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("getting client: %w", err)
 	}
-	return c.SelectMailbox(name)
+	return mbox, nil
 }

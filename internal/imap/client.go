@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -33,14 +34,14 @@ func NewClient(account *domain.Account, provider auth.Provider, host string) *Cl
 }
 
 // Connect dials the IMAP server over TLS and authenticates.
-func (c *Client) Connect() error {
+func (c *Client) Connect(ctx context.Context) error {
 	conn, err := client.DialTLS(c.host, &tls.Config{})
 	if err != nil {
 		return fmt.Errorf("dialing %s: %w", c.host, err)
 	}
 	c.conn = conn
 
-	saslClient, err := c.provider.SASLClient(c.account.ID)
+	saslClient, err := c.provider.SASLClient(ctx, c.account.ID, c.account.Email)
 	if err != nil {
 		c.conn.Logout()
 		c.conn = nil
@@ -124,7 +125,7 @@ func (c *Client) FetchEnvelopes(limit uint32) ([]*domain.Envelope, error) {
 		return nil, fmt.Errorf("no mailbox selected")
 	}
 
-	if mbox.Messages == 0 {
+	if mbox.Messages == 0 || limit == 0 {
 		return nil, nil
 	}
 
@@ -188,6 +189,9 @@ func (c *Client) FetchMessage(uid uint32) (*domain.Message, error) {
 	}
 	if msg == nil {
 		return nil, fmt.Errorf("message %d not found", uid)
+	}
+	if msg.Envelope == nil {
+		return nil, fmt.Errorf("message %d has no ENVELOPE", uid)
 	}
 
 	result := &domain.Message{

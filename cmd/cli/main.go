@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -30,7 +33,8 @@ func main() {
 	defer client.Close()
 
 	// Try connecting existing accounts
-	if err := client.ConnectAll(); err != nil {
+	ctx := context.Background()
+	if err := client.ConnectAll(ctx); err != nil {
 		fmt.Printf("Warning: %v\n", err)
 	}
 
@@ -58,7 +62,7 @@ func main() {
 			return
 
 		case "accounts":
-			handleAccounts(client, args[1:])
+			handleAccounts(client, scanner, args[1:])
 
 		case "mailboxes":
 			handleMailboxes(client, args[1:])
@@ -87,7 +91,7 @@ func main() {
 	}
 }
 
-func handleAccounts(client *mailclient.Client, args []string) {
+func handleAccounts(client *mailclient.Client, scanner *bufio.Scanner, args []string) {
 	if len(args) == 0 {
 		fmt.Println("Usage: accounts [list|add|remove <id>]")
 		return
@@ -109,7 +113,7 @@ func handleAccounts(client *mailclient.Client, args []string) {
 		}
 
 	case "add":
-		addAccount(client)
+		addAccount(client, scanner)
 
 	case "remove":
 		if len(args) < 2 {
@@ -127,8 +131,15 @@ func handleAccounts(client *mailclient.Client, args []string) {
 	}
 }
 
-func addAccount(client *mailclient.Client) {
-	scanner := bufio.NewScanner(os.Stdin)
+func addAccount(client *mailclient.Client, scanner *bufio.Scanner) {
+	ctx := context.Background()
+
+	// Ask for email first (we need it for account creation)
+	fmt.Print("Enter your Gmail address: ")
+	if !scanner.Scan() {
+		return
+	}
+	email := strings.TrimSpace(scanner.Text())
 
 	authURL, err := client.StartAddAccount("gmail")
 	if err != nil {
@@ -136,23 +147,63 @@ func addAccount(client *mailclient.Client) {
 		return
 	}
 
+	// Start a temporary HTTP server to catch the OAuth callback
+	type callbackResult struct {
+		code  string
+		state string
+	}
+	resultCh := make(chan callbackResult, 1)
+	errCh := make(chan error, 1)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			http.Error(w, "No code in callback", http.StatusBadRequest)
+			errCh <- fmt.Errorf("no code in OAuth callback")
+			return
+		}
+		state := r.URL.Query().Get("state")
+
+		fmt.Fprintf(w, "<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to the terminal.</p></body></html>")
+		resultCh <- callbackResult{code: code, state: state}
+	})
+
+	listener, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		fmt.Printf("Error starting callback server: %v\n", err)
+		fmt.Println("Port 8080 may be in use. Free it and try again.")
+		return
+	}
+
+	srv := &http.Server{Handler: mux}
+	go func() {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		}
+	}()
+
+	fmt.Println()
 	fmt.Println("Open this URL in your browser:")
 	fmt.Println(authURL)
 	fmt.Println()
+	fmt.Println("Waiting for authorization...")
 
-	fmt.Print("Enter your email address: ")
-	if !scanner.Scan() {
+	// Wait for the callback or an error
+	var result callbackResult
+	select {
+	case result = <-resultCh:
+		// Got the code and state!
+	case err := <-errCh:
+		srv.Shutdown(ctx)
+		fmt.Printf("Error during auth: %v\n", err)
 		return
 	}
-	email := strings.TrimSpace(scanner.Text())
 
-	fmt.Print("Enter the authorization code: ")
-	if !scanner.Scan() {
-		return
-	}
-	code := strings.TrimSpace(scanner.Text())
+	// Shut down the temporary server
+	srv.Shutdown(ctx)
 
-	account, err := client.CompleteAddAccount("gmail", email, code)
+	account, err := client.CompleteAddAccount(ctx, "gmail", email, result.code, result.state)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
@@ -161,7 +212,7 @@ func addAccount(client *mailclient.Client) {
 	fmt.Printf("Account added: [%s] %s\n", account.ID, account.Email)
 
 	// Try connecting immediately
-	if err := client.ConnectAll(); err != nil {
+	if err := client.ConnectAll(ctx); err != nil {
 		fmt.Printf("Warning connecting: %v\n", err)
 	}
 }
@@ -292,8 +343,15 @@ func handleRead(client *mailclient.Client, args []string) {
 }
 
 func truncate(s string, max int) string {
-	if len(s) <= max {
+	if max <= 0 {
+		return ""
+	}
+	if max <= 3 {
+		return strings.Repeat(".", max)
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
 		return s
 	}
-	return s[:max-3] + "..."
+	return string(runes[:max-3]) + "..."
 }

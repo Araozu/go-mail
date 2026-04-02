@@ -1,10 +1,13 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/oauth2"
@@ -12,8 +15,8 @@ import (
 
 // TokenStore manages persistence of OAuth2 tokens.
 type TokenStore interface {
-	Save(accountID string, token *oauth2.Token) error
-	Load(accountID string) (*oauth2.Token, error)
+	Save(ctx context.Context, accountID string, token *oauth2.Token) error
+	Load(ctx context.Context, accountID string) (*oauth2.Token, error)
 	Delete(accountID string) error
 }
 
@@ -31,12 +34,31 @@ func NewJSONTokenStore(dir string) (*JSONTokenStore, error) {
 	return &JSONTokenStore{dir: dir}, nil
 }
 
+// validateAccountID rejects account IDs that could escape the token directory.
+func validateAccountID(accountID string) error {
+	if accountID == "" {
+		return fmt.Errorf("empty account ID")
+	}
+	if strings.ContainsAny(accountID, `/\`) {
+		return fmt.Errorf("invalid account ID: contains path separator")
+	}
+	cleaned := filepath.Base(filepath.Clean(accountID))
+	if cleaned != accountID || cleaned == ".." || cleaned == "." {
+		return fmt.Errorf("invalid account ID: %q", accountID)
+	}
+	return nil
+}
+
 func (s *JSONTokenStore) tokenPath(accountID string) string {
 	return filepath.Join(s.dir, accountID+".json")
 }
 
 // Save persists a token for the given account.
-func (s *JSONTokenStore) Save(accountID string, token *oauth2.Token) error {
+func (s *JSONTokenStore) Save(_ context.Context, accountID string, token *oauth2.Token) error {
+	if err := validateAccountID(accountID); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -48,7 +70,11 @@ func (s *JSONTokenStore) Save(accountID string, token *oauth2.Token) error {
 }
 
 // Load reads a stored token for the given account.
-func (s *JSONTokenStore) Load(accountID string) (*oauth2.Token, error) {
+func (s *JSONTokenStore) Load(_ context.Context, accountID string) (*oauth2.Token, error) {
+	if err := validateAccountID(accountID); err != nil {
+		return nil, err
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -69,6 +95,10 @@ func (s *JSONTokenStore) Load(accountID string) (*oauth2.Token, error) {
 
 // Delete removes a stored token for the given account.
 func (s *JSONTokenStore) Delete(accountID string) error {
+	if err := validateAccountID(accountID); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

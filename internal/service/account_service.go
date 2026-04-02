@@ -1,8 +1,10 @@
 package service
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	"github.com/Araozu/go-mail/internal/auth"
@@ -44,8 +46,9 @@ func (s *AccountService) StartAddAccount(providerName string) (authURL string, e
 }
 
 // CompleteAddAccount finishes the OAuth flow with the auth code and
-// creates a new account. Returns the created account.
-func (s *AccountService) CompleteAddAccount(providerName, email, code string) (*domain.Account, error) {
+// creates a new account. The state parameter must match the state from
+// the OAuth callback. Returns the created account.
+func (s *AccountService) CompleteAddAccount(ctx context.Context, providerName, email, code, state string) (*domain.Account, error) {
 	provider, ok := s.providers[providerName]
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", providerName)
@@ -64,7 +67,7 @@ func (s *AccountService) CompleteAddAccount(providerName, email, code string) (*
 	}
 
 	// Exchange code and save token
-	if err := provider.CompleteFlowWithAccount(code, account.ID); err != nil {
+	if err := provider.CompleteFlowWithAccount(ctx, state, code, account.ID); err != nil {
 		return nil, fmt.Errorf("completing auth flow: %w", err)
 	}
 
@@ -93,7 +96,7 @@ func (s *AccountService) ListAccounts() ([]*domain.Account, error) {
 }
 
 // ConnectAll loads all stored accounts and connects them.
-func (s *AccountService) ConnectAll() error {
+func (s *AccountService) ConnectAll(ctx context.Context) error {
 	accounts, err := s.store.LoadAccounts()
 	if err != nil {
 		return fmt.Errorf("loading accounts: %w", err)
@@ -110,19 +113,17 @@ func (s *AccountService) ConnectAll() error {
 		}
 
 		if err := s.manager.AddAccount(account, provider); err != nil {
-			// May already be registered
-			continue
-		}
-
-		c, err := s.manager.GetClient(account.ID)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("getting client for %s: %w", account.Email, err)
+			if !errors.Is(err, imapPkg.ErrAccountExists) {
+				// Real failure — record and skip this account.
+				if firstErr == nil {
+					firstErr = fmt.Errorf("registering %s: %w", account.Email, err)
+				}
+				continue
 			}
-			continue
+			// Already registered — fall through to connect.
 		}
 
-		if err := c.Connect(); err != nil {
+		if err := s.manager.ConnectClient(ctx, account.ID); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("connecting %s: %w", account.Email, err)
 			}

@@ -1,9 +1,12 @@
 package mailclient
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 
 	"github.com/Araozu/go-mail/internal/auth"
 	"github.com/Araozu/go-mail/internal/domain"
@@ -20,6 +23,8 @@ type Client struct {
 	messages  *service.MessageService
 	manager   *imapPkg.Manager
 	events    chan Event
+	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
 // New creates a new mail client with the given options.
@@ -69,9 +74,14 @@ func New(opts ...Option) (*Client, error) {
 		accountSvc.RegisterProvider("gmail", gmailProvider)
 	}
 
+	mailboxSvc, err := service.NewMailboxService(manager)
+	if err != nil {
+		return nil, fmt.Errorf("creating mailbox service: %w", err)
+	}
+
 	return &Client{
 		accounts:  accountSvc,
-		mailboxes: service.NewMailboxService(manager),
+		mailboxes: mailboxSvc,
 		messages:  service.NewMessageService(manager),
 		manager:   manager,
 		events:    make(chan Event, options.EventBufferSize),
@@ -86,11 +96,19 @@ func (c *Client) StartAddAccount(provider string) (string, error) {
 	return c.accounts.StartAddAccount(provider)
 }
 
-// CompleteAddAccount finishes the OAuth flow with the auth code.
-func (c *Client) CompleteAddAccount(provider, email, code string) (*domain.Account, error) {
-	account, err := c.accounts.CompleteAddAccount(provider, email, code)
+// CompleteAddAccount finishes the OAuth flow with the auth code and state.
+// After registering the account, it attempts to connect the IMAP session
+// and only emits EventConnected if the connection succeeds.
+func (c *Client) CompleteAddAccount(ctx context.Context, provider, email, code, state string) (*domain.Account, error) {
+	account, err := c.accounts.CompleteAddAccount(ctx, provider, email, code, state)
 	if err != nil {
 		return nil, err
+	}
+
+	// Attempt to connect the newly registered account.
+	if err := c.manager.ConnectClient(ctx, account.ID); err != nil {
+		// Account is registered but not connected.
+		return account, fmt.Errorf("account added but connection failed: %w", err)
 	}
 
 	c.emit(Event{
@@ -119,8 +137,8 @@ func (c *Client) ListAccounts() ([]*domain.Account, error) {
 }
 
 // ConnectAll loads stored accounts and connects them all.
-func (c *Client) ConnectAll() error {
-	return c.accounts.ConnectAll()
+func (c *Client) ConnectAll(ctx context.Context) error {
+	return c.accounts.ConnectAll(ctx)
 }
 
 // --- Mailbox operations ---
@@ -142,24 +160,24 @@ func (c *Client) GetMessage(accountID, mailbox string, uid uint32) (*domain.Mess
 	return c.messages.GetMessage(accountID, mailbox, uid)
 }
 
-// MarkRead marks a message as read.
-func (c *Client) MarkRead(accountID string, uid uint32) error {
-	return c.messages.MarkRead(accountID, uid)
+// MarkRead marks a message as read in the given mailbox.
+func (c *Client) MarkRead(accountID, mailbox string, uid uint32) error {
+	return c.messages.MarkRead(accountID, mailbox, uid)
 }
 
-// MarkUnread marks a message as unread.
-func (c *Client) MarkUnread(accountID string, uid uint32) error {
-	return c.messages.MarkUnread(accountID, uid)
+// MarkUnread marks a message as unread in the given mailbox.
+func (c *Client) MarkUnread(accountID, mailbox string, uid uint32) error {
+	return c.messages.MarkUnread(accountID, mailbox, uid)
 }
 
-// FlagMessage flags a message.
-func (c *Client) FlagMessage(accountID string, uid uint32) error {
-	return c.messages.FlagMessage(accountID, uid)
+// FlagMessage flags a message in the given mailbox.
+func (c *Client) FlagMessage(accountID, mailbox string, uid uint32) error {
+	return c.messages.FlagMessage(accountID, mailbox, uid)
 }
 
-// UnflagMessage unflags a message.
-func (c *Client) UnflagMessage(accountID string, uid uint32) error {
-	return c.messages.UnflagMessage(accountID, uid)
+// UnflagMessage unflags a message in the given mailbox.
+func (c *Client) UnflagMessage(accountID, mailbox string, uid uint32) error {
+	return c.messages.UnflagMessage(accountID, mailbox, uid)
 }
 
 // --- Events ---
@@ -172,14 +190,22 @@ func (c *Client) Events() <-chan Event {
 // --- Lifecycle ---
 
 // Close disconnects all accounts and closes the event channel.
+// It is safe to call multiple times; only the first call has any effect.
 func (c *Client) Close() error {
-	c.manager.DisconnectAll()
-	close(c.events)
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		c.manager.DisconnectAll()
+		close(c.events)
+	})
 	return nil
 }
 
 // emit sends an event to the events channel without blocking.
+// It is a no-op after Close has been called.
 func (c *Client) emit(e Event) {
+	if c.closed.Load() {
+		return
+	}
 	select {
 	case c.events <- e:
 	default:

@@ -47,8 +47,12 @@ func WithGmailRedirectURL(url string) Option {
 }
 
 // WithEventBufferSize sets the event channel buffer size.
+// Negative values are clamped to 0.
 func WithEventBufferSize(size int) Option {
 	return func(o *Options) {
+		if size < 0 {
+			size = 0
+		}
 		o.EventBufferSize = size
 	}
 }

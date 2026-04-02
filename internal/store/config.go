@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -38,6 +39,13 @@ func (s *JSONConfigStore) accountsPath() string {
 
 // SaveAccount adds or updates an account in the store.
 func (s *JSONConfigStore) SaveAccount(account *domain.Account) error {
+	if account == nil {
+		return fmt.Errorf("nil account")
+	}
+	if account.ID == "" {
+		return fmt.Errorf("empty account ID")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -110,5 +118,41 @@ func (s *JSONConfigStore) writeAccounts(accounts []*domain.Account) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.accountsPath(), data, 0600)
+
+	target := s.accountsPath()
+	dir := filepath.Dir(target)
+
+	// Write to a temp file in the same directory, then atomically rename.
+	tmp, err := os.CreateTemp(dir, ".accounts-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("syncing temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("setting permissions: %w", err)
+	}
+
+	if err := os.Rename(tmpName, target); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("renaming temp file: %w", err)
+	}
+
+	return nil
 }
